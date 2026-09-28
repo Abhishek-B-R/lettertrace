@@ -12,7 +12,7 @@ import {
   Timer,
 } from "lucide-react";
 import { Badge, Button, Card } from "@/components/ui";
-import { LetterstoryLogo, Logo } from "@/components/logo";
+import { LetterCompanyGlyph, Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme";
 import { InstallCli } from "@/components/install-cli";
 import { LetterCoTelemetry } from "@/components/letterco-telemetry";
@@ -239,11 +239,11 @@ export default function LandingPage() {
               href="https://letter.company"
               target="_blank"
               rel="noopener"
-              aria-label="Letterstory"
-              title="Letterstory"
-              className="inline-flex items-center px-2 py-2 text-ink-soft transition hover:text-ink"
+              aria-label="The Letter Company"
+              title="The Letter Company"
+              className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded border border-ink/15 bg-black text-white transition-colors hover:border-ink/35 focus:outline-none focus-visible:ring-2 focus-visible:ring-terracotta/40 focus-visible:ring-offset-2 focus-visible:ring-offset-paper"
             >
-              <LetterstoryLogo />
+              <LetterCompanyGlyph className="h-7" />
             </a>
           </div>
           <p className="mt-4 animate-fade-up font-mono text-xs text-ink-faint [animation-delay:750ms]">
