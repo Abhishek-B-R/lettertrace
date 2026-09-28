@@ -58,3 +58,24 @@ export function Logo({
     </span>
   );
 }
+
+// The Letterstory wordmark (the parent brand, from letterstory/public/logos).
+// The source SVG is a single white fill, so it's used as a CSS mask over
+// bg-current: the mark takes the surrounding text colour and follows the
+// theme tokens in both light and dark mode, with no per-theme asset.
+export function LetterstoryLogo({ className }: { className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn("inline-block aspect-[543/142] h-5 shrink-0 bg-current", className)}
+      style={{
+        maskImage: "url(/images/letterstory.svg)",
+        WebkitMaskImage: "url(/images/letterstory.svg)",
+        maskRepeat: "no-repeat",
+        WebkitMaskRepeat: "no-repeat",
+        maskSize: "contain",
+        WebkitMaskSize: "contain",
+      }}
+    />
+  );
+}
