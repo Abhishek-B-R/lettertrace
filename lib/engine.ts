@@ -14,7 +14,7 @@ import { detectMention, brandTerms } from "@/lib/mentions";
 import { pageKey } from "@/lib/metrics";
 import { analysisModelFor, modelLabel } from "@/lib/models";
 import { spendMicros } from "@/lib/pricing";
-import { recordOps, recordOpsError } from "@/lib/ops";
+import { recordOps, recordOpsError, signatureOf } from "@/lib/ops";
 import { logActivity } from "@/lib/activity";
 import { selectAll } from "@/lib/paging";
 import { recordRun, withSpan } from "@/lib/otel";
@@ -120,6 +120,26 @@ export function askDeadlineFor(startedMs: number, timeBudgetMs: number): number 
   return startedMs + timeBudgetMs + TIME_BUDGET_RESERVE_MS - SETTLE_MARGIN_MS;
 }
 
+/**
+ * Stop dispatching once this many asks have failed with the same error before
+ * a single answer was stored.
+ *
+ * A run's asks all share one key, one route, one model and one request shape,
+ * so when the first several fail identically the rest will too, and every one
+ * of them is still a call made. From 2026-09-23 to 2026-09-26 Concentrate
+ * rejected every forced web-search Anthropic call (see isToolChoiceMismatch),
+ * and each affected run still sent all of its asks: ~9,000 calls across 77
+ * runs for zero answers. That rejection happened not to be billed. A failure
+ * that lands after the provider has generated (a malformed reply, a parse
+ * error) would be, on every ask.
+ *
+ * Only a run that has stored nothing can trip it, and only on one repeated
+ * error: a run that has shown it can answer, or whose failures differ, is
+ * having transient trouble rather than a broken setup, and keeps going. Equal
+ * to CONCURRENCY so the whole first wave has to fail before the run gives up.
+ */
+export const FAIL_FAST_AFTER = CONCURRENCY;
+
 // Flush the progress counter every few answers rather than every answer — the
 // row is a checkpoint, not a log. Fixed rather than tied to CONCURRENCY so a
 // wider pool doesn't make completed_count staler for whoever reads it mid-run.
@@ -187,6 +207,9 @@ export interface RunResult {
    *  serverless invocation: the answers stored are real, the rest were never
    *  asked, and the run row says so rather than being found dead later. */
   timeStopped?: boolean;
+  /** Set when the run stopped early because its first FAIL_FAST_AFTER asks all
+   *  failed with the same error and none succeeded: the rest were never sent. */
+  failFastStopped?: boolean;
   error?: string;
 }
 
@@ -533,6 +556,14 @@ async function resumeRunMeasured(
   // cannot carry the run past the kill on an ask that started in time.
   const askDeadlineMs = params.askDeadlineMs ?? askDeadlineFor(startedMs, timeBudgetMs);
 
+  // The third ceiling: a run whose first asks all fail the same way is broken,
+  // not unlucky (FAIL_FAST_AFTER). Compared by signature, so the same error with
+  // a different retry-after or request id still counts as the same error.
+  let failFastStopped = false;
+  let firstFailureSig: string | null = null;
+  let identicalFailures = 0;
+  let failuresDiffer = false;
+
   await mapPool(jobs, CONCURRENCY, async (prompt) => {
     // Checked per job rather than up front: the run is concurrent, so this is
     // the point where in-flight answers have already reported their cost. Jobs
@@ -546,6 +577,7 @@ async function resumeRunMeasured(
       timeStopped = true;
       return;
     }
+    if (failFastStopped) return;
     try {
       const { text: answer, tokens: qTokens, sources, fallback } = await runQuery({
         provider,
@@ -728,7 +760,8 @@ async function resumeRunMeasured(
         return;
       }
       // A single failed ask shouldn't kill the whole run.
-      if (!hardError) hardError = humanError(err);
+      const message = humanError(err);
+      if (!hardError) hardError = message;
       // ...but every one of them is recorded. Only the FIRST becomes the run's
       // error message, so without this a run that lost 90 of 100 answers to a
       // rate limit looks identical to one that lost a single answer.
@@ -744,6 +777,13 @@ async function resumeRunMeasured(
         route: route?.router ?? "direct",
         key_source: params.keySource ?? "unknown",
       });
+      // The same failure on every ask before any answer is a broken run, though.
+      if (succeeded === 0 && !failuresDiffer) {
+        const sig = signatureOf(message);
+        firstFailureSig ??= sig;
+        if (sig !== firstFailureSig) failuresDiffer = true;
+        else if (++identicalFailures >= FAIL_FAST_AFTER) failFastStopped = true;
+      }
     } finally {
       processed++;
       // Periodic progress checkpoint, completed_count reflects stored answers.
@@ -762,7 +802,7 @@ async function resumeRunMeasured(
   // answers that were stored are as good as any other run's. But it IS a
   // shortfall, and a run that silently returns 40 of 200 answers would look
   // like the prompts stopped working. Say which it was, in the run's own row.
-  const stoppedEarly = budgetStopped || timeStopped;
+  const stoppedEarly = budgetStopped || timeStopped || failFastStopped;
   const shortfall = stoppedEarly ? jobs.length - processed + timedOutAsks : 0;
   const budgetNote = budgetStopped
     ? `Stopped after ${succeeded} of ${jobs.length} answers: this account reached its free-usage limit. ` +
@@ -771,6 +811,12 @@ async function resumeRunMeasured(
       ? `Stopped after ${succeeded} of ${jobs.length} answers: the run reached its ${Math.round(timeBudgetMs / 60000)}-minute time limit. ` +
         `Run it again to collect the remaining ${shortfall}, or split the project's prompts across fewer engines per run.`
       : null;
+  // Appended to the provider's error rather than replacing it: the error is the
+  // diagnosis, this only says why most of the run was never asked.
+  const failFastNote = failFastStopped
+    ? `Stopped after the first ${identicalFailures} asks all failed with this same error; the other ${shortfall} were not sent.`
+    : null;
+  const diagnosis = hardError && failFastNote ? `${hardError} (${failFastNote})` : hardError;
   await supabase
     .from("runs")
     .update({
@@ -779,8 +825,8 @@ async function resumeRunMeasured(
       finished_at: finishedAt,
       error:
         status === "failed"
-          ? hardError ?? budgetNote ?? "No answers were stored, every prompt failed."
-          : budgetNote,
+          ? diagnosis ?? budgetNote ?? "No answers were stored, every prompt failed."
+          : budgetNote ?? failFastNote,
     })
     .eq("id", runId);
 
@@ -801,7 +847,7 @@ async function resumeRunMeasured(
           : timeStopped
             ? `Run stopped at the time limit: ${succeeded} of ${jobs.length} ${jobs.length === 1 ? "answer" : "answers"} stored on ${modelLabel(provider, model)}`
             : `Run completed: ${succeeded} of ${jobs.length} ${jobs.length === 1 ? "answer" : "answers"} stored on ${modelLabel(provider, model)}`
-        : `Run failed: ${hardError ?? budgetNote ?? "no answers were stored"}`,
+        : `Run failed: ${diagnosis ?? budgetNote ?? "no answers were stored"}`,
     durationMs: Date.now() - startedMs,
     metadata: {
       provider,
@@ -812,6 +858,7 @@ async function resumeRunMeasured(
       spend_micros: spentMicros,
       ...(budgetStopped ? { budget_stopped: true, unrun_prompts: shortfall } : {}),
       ...(timeStopped ? { time_stopped: true, unrun_prompts: shortfall } : {}),
+      ...(failFastStopped ? { fail_fast_stopped: true, unrun_prompts: shortfall } : {}),
       ...(hardError ? { error: hardError } : {}),
     },
   });
@@ -834,6 +881,7 @@ async function resumeRunMeasured(
       duration_ms: Date.now() - startedMs,
       budget_stopped: Boolean(budgetStopped),
       time_stopped: Boolean(timeStopped),
+      fail_fast_stopped: failFastStopped,
     },
   });
 
@@ -845,6 +893,7 @@ async function resumeRunMeasured(
     spendMicros: spentMicros,
     ...(budgetStopped ? { budgetStopped: true } : {}),
     ...(timeStopped ? { timeStopped: true } : {}),
+    ...(failFastStopped ? { failFastStopped: true } : {}),
     error: hardError,
   };
 }
